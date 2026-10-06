@@ -1,0 +1,188 @@
+name: Handy model shortcut CI
+
+on:
+  push:
+    branches:
+      - ci/handy-model-shortcut-20261006
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out Handy
+        uses: actions/checkout@v4
+        with:
+          repository: cjpais/Handy
+          path: handy
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev libevdev-dev libasound2-dev pkg-config libssl-dev libvulkan-dev vulkan-tools glslc spirv-headers glslang-tools libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-layer-shell0 libgtk-layer-shell-dev patchelf cmake
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply model-specific remote shortcut patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cli = Path("handy/src-tauri/src/cli.rs")
+          text = cli.read_text()
+          old = "    /// Model id to load for --transcribe-file (default: the selected model).\n"
+          new = (
+              "    /// Model id to use for --transcribe-file or a remote transcription toggle\n"
+              "    /// (default: the selected model).\n"
+          )
+          assert old in text
+          cli.write_text(text.replace(old, new, 1))
+
+          lib = Path("handy/src-tauri/src/lib.rs")
+          text = lib.read_text()
+          marker = "pub static WEBVIEW_LOG_STREAMING: AtomicBool = AtomicBool::new(false);\n"
+          helper = r'''
+          
+          fn forwarded_model_arg(args: &[String]) -> Option<String> {
+              for (index, arg) in args.iter().enumerate() {
+                  if let Some(value) = arg.strip_prefix("--model=") {
+                      if !value.is_empty() {
+                          return Some(value.to_string());
+                      }
+                  }
+
+                  if arg == "--model" {
+                      if let Some(value) = args.get(index + 1) {
+                          if !value.is_empty() && !value.starts_with("--") {
+                              return Some(value.clone());
+                          }
+                      }
+                  }
+              }
+
+              None
+          }
+          '''
+          assert marker in text
+          text = text.replace(marker, marker + helper, 1)
+
+          old = r'''            if args.iter().any(|a| a == "--toggle-transcription") {
+                          signal_handle::send_transcription_input(app, "transcribe", "CLI");
+                      } else if args.iter().any(|a| a == "--toggle-post-process") {
+                          signal_handle::send_transcription_input(app, "transcribe_with_post_process", "CLI");
+          '''
+          new = r'''            if args.iter().any(|a| a == "--toggle-transcription") {
+                          if let Some(model_id) = forwarded_model_arg(&args) {
+                              if let Err(error) = commands::models::switch_active_model(app, &model_id) {
+                                  log::error!(
+                                      "Failed to switch model '{}' for CLI transcription: {}",
+                                      model_id,
+                                      error
+                                  );
+                                  return;
+                              }
+                          }
+                          signal_handle::send_transcription_input(app, "transcribe", "CLI");
+                      } else if args.iter().any(|a| a == "--toggle-post-process") {
+                          if let Some(model_id) = forwarded_model_arg(&args) {
+                              if let Err(error) = commands::models::switch_active_model(app, &model_id) {
+                                  log::error!(
+                                      "Failed to switch model '{}' for CLI post-processing transcription: {}",
+                                      model_id,
+                                      error
+                                  );
+                                  return;
+                              }
+                          }
+                          signal_handle::send_transcription_input(app, "transcribe_with_post_process", "CLI");
+          '''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          test_marker = "#[allow(unused_variables)]\nfn should_force_show_permissions_window"
+          tests = r'''
+          #[cfg(test)]
+          mod forwarded_model_arg_tests {
+              use super::forwarded_model_arg;
+
+              #[test]
+              fn parses_separate_model_argument() {
+                  let args = vec![
+                      "handy".to_string(),
+                      "--model".to_string(),
+                      "parakeet-v3".to_string(),
+                      "--toggle-transcription".to_string(),
+                  ];
+                  assert_eq!(forwarded_model_arg(&args), Some("parakeet-v3".to_string()));
+              }
+
+              #[test]
+              fn parses_equals_model_argument() {
+                  let args = vec![
+                      "handy".to_string(),
+                      "--model=ggml-small".to_string(),
+                      "--toggle-transcription".to_string(),
+                  ];
+                  assert_eq!(forwarded_model_arg(&args), Some("ggml-small".to_string()));
+              }
+
+              #[test]
+              fn ignores_missing_or_flag_model_values() {
+                  let args = vec![
+                      "handy".to_string(),
+                      "--model".to_string(),
+                      "--toggle-transcription".to_string(),
+                  ];
+                  assert_eq!(forwarded_model_arg(&args), None);
+              }
+          }
+
+          '''
+          assert test_marker in text
+          text = text.replace(test_marker, tests + test_marker, 1)
+          lib.write_text(text)
+
+          readme = Path("handy/README.md")
+          text = readme.read_text()
+          old = r'''handy --toggle-transcription    # Toggle recording on/off
+          handy --toggle-post-process     # Toggle recording with post-processing on/off
+          handy --cancel                  # Cancel the current operation
+          '''
+          new = r'''handy --toggle-transcription    # Toggle recording on/off
+          handy --toggle-post-process     # Toggle recording with post-processing on/off
+          handy --cancel                  # Cancel the current operation
+          handy --model <id> --toggle-transcription
+                                          # Switch to <id>, then toggle recording
+          handy --model <id> --toggle-post-process
+                                          # Switch to <id>, then toggle with post-processing
+          '''
+          assert old in text
+          text = text.replace(old, new, 1)
+          insertion = r'''
+          `--model` accepts the same ids shown by `handy --list-models`. When a running
+          Handy instance receives a remote transcription command with `--model`, it
+          switches to that installed model before recording starts. This makes it
+          possible to bind separate operating-system shortcuts to different models.
+
+          For example:
+
+          ```bash
+          handy --model ggml-small --toggle-transcription
+          handy --model parakeet-v3 --toggle-transcription
+          ```
+
+          '''
+          anchor = "**Startup flags:**\n"
+          assert anchor in text
+          text = text.replace(anchor, insertion + anchor, 1)
+          readme.write_text(text)
+          PY
+
+      - name: Format check
+        working-directory: handy
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Run targeted Rust tests
+        working-directory: handy
+        run: cargo test --manifest-path src-tauri/Cargo.toml forwarded_model_arg_tests --lib -- --nocapture
