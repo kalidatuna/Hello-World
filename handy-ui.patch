@@ -1,5 +1,5 @@
 diff --git a/src-tauri/src/actions.rs b/src-tauri/src/actions.rs
-index cce7cfe..3c947b2 100644
+index cce7cfe..54e0e3d 100644
 --- a/src-tauri/src/actions.rs
 +++ b/src-tauri/src/actions.rs
 @@ -389,6 +389,26 @@ impl ShortcutAction for TranscribeAction {
@@ -14,16 +14,16 @@ index cce7cfe..3c947b2 100644
 +                _ => String::new(),
 +            }
 +        };
-+        if !configured_model.is_empty()
-+            && get_settings(app).selected_model != configured_model
-+            && let Err(error) =
++        if !configured_model.is_empty() && get_settings(app).selected_model != configured_model {
++            if let Err(error) =
 +                crate::commands::models::switch_active_model_for_shortcut(app, &configured_model)
-+        {
-+            warn!(
-+                "Not starting recording: failed to switch '{}' to model '{}': {}",
-+                binding_id, configured_model, error
-+            );
-+            return;
++            {
++                warn!(
++                    "Not starting recording: failed to switch '{}' to model '{}': {}",
++                    binding_id, configured_model, error
++                );
++                return;
++            }
 +        }
 +
          // Load model in the background
