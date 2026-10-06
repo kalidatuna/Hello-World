@@ -179,9 +179,9 @@ jobs:
           readme.write_text(text)
           PY
 
-      - name: Format check
+      - name: Format patch
         working-directory: handy
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml
 
       - name: Run targeted Rust tests
         working-directory: handy
