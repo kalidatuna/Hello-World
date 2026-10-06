@@ -39,6 +39,10 @@ a94b403e0610049fafa54b0a4077db2945084dd8 and adds:
 - normal Handy shortcut activation behavior for both transcription shortcuts;
 - translation keys across every locale so translation-key validation remains
   consistent.
+- secondary shortcut registration stays disabled until a secondary model is selected;
+- shortcut-driven model selection validates downloaded models and loads them off the coordinator thread;
+- post-process transcription returns to the primary shortcut model after secondary use;
+- deleting a pinned model clears stale shortcut model references.
 
 The workflow applies the patch to the pinned upstream commit and validates Rust
 formatting, frontend formatting, translation keys, TypeScript/Vite build,
