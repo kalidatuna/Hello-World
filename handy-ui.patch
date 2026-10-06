@@ -43,7 +43,7 @@ index cce7cfe..5610846 100644
          "transcribe_with_post_process".to_string(),
          Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
 diff --git a/src-tauri/src/commands/models.rs b/src-tauri/src/commands/models.rs
-index b1bb894..04a1174 100644
+index b1bb894..5896dfb 100644
 --- a/src-tauri/src/commands/models.rs
 +++ b/src-tauri/src/commands/models.rs
 @@ -2,6 +2,7 @@ use crate::managers::model::{ModelInfo, ModelManager};
@@ -54,7 +54,7 @@ index b1bb894..04a1174 100644
  use std::sync::Arc;
  use tauri::{AppHandle, Emitter, Manager, State};
  
-@@ -27,13 +28,71 @@ pub async fn get_model_info(
+@@ -27,13 +28,75 @@ pub async fn get_model_info(
  #[tauri::command]
  #[specta::specta]
  pub async fn rescan_local_models(
@@ -74,18 +74,22 @@ index b1bb894..04a1174 100644
 +
 +fn reconcile_shortcut_model_pins(app: &AppHandle) -> Result<(), String> {
 +    let model_manager = app.state::<Arc<ModelManager>>();
-+    let downloaded: HashSet<String> = model_manager
-+        .get_available_models()
-+        .into_iter()
++    let available_models = model_manager.get_available_models();
++    let downloaded: HashSet<String> = available_models
++        .iter()
 +        .filter(|model| model.is_downloaded)
-+        .map(|model| model.id)
++        .map(|model| model.id.clone())
 +        .collect();
 +
 +    let mut settings = get_settings(app);
 +    let fallback = if downloaded.contains(&settings.selected_model) {
 +        settings.selected_model.clone()
 +    } else {
-+        downloaded.iter().next().cloned().unwrap_or_default()
++        available_models
++            .iter()
++            .find(|model| model.is_downloaded)
++            .map(|model| model.id.clone())
++            .unwrap_or_default()
 +    };
 +
 +    let invalid_primary = !settings.primary_shortcut_model.is_empty()
@@ -127,7 +131,7 @@ index b1bb894..04a1174 100644
  }
  
  #[tauri::command]
-@@ -69,21 +128,55 @@ pub async fn delete_model(
+@@ -69,21 +132,55 @@ pub async fn delete_model(
      transcription_manager: State<'_, Arc<TranscriptionManager>>,
      model_id: String,
  ) -> Result<(), String> {
@@ -192,7 +196,7 @@ index b1bb894..04a1174 100644
  }
  
  /// Shared logic for switching the active model, used by both the Tauri command
-@@ -93,6 +186,57 @@ pub async fn delete_model(
+@@ -93,6 +190,57 @@ pub async fn delete_model(
  /// unless the unload timeout is set to "Immediately" (in which case the model
  /// will be loaded on-demand during the next transcription).
  pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String> {
@@ -250,7 +254,7 @@ index b1bb894..04a1174 100644
      let model_manager = app.state::<Arc<ModelManager>>();
      let transcription_manager = app.state::<Arc<TranscriptionManager>>();
  
-@@ -115,12 +259,16 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
+@@ -115,12 +263,16 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
      let settings = get_settings(app);
      let unload_timeout = settings.model_unload_timeout;
      let old_model = settings.selected_model.clone();
@@ -267,7 +271,7 @@ index b1bb894..04a1174 100644
      settings.onboarding_completed = true;
  
      write_settings(app, settings);
-@@ -150,6 +298,7 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
+@@ -150,6 +302,7 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
      if let Err(e) = transcription_manager.load_model(model_id) {
          let mut settings = get_settings(app);
          settings.selected_model = old_model;
