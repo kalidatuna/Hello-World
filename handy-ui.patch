@@ -43,10 +43,91 @@ index cce7cfe..5610846 100644
          "transcribe_with_post_process".to_string(),
          Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
 diff --git a/src-tauri/src/commands/models.rs b/src-tauri/src/commands/models.rs
-index b1bb894..9606a7c 100644
+index b1bb894..04a1174 100644
 --- a/src-tauri/src/commands/models.rs
 +++ b/src-tauri/src/commands/models.rs
-@@ -69,21 +69,55 @@ pub async fn delete_model(
+@@ -2,6 +2,7 @@ use crate::managers::model::{ModelInfo, ModelManager};
+ use crate::managers::transcription::{ModelStateEvent, TranscriptionManager};
+ use crate::settings::{get_settings, write_settings, ModelUnloadTimeout};
+ use log::error;
++use std::collections::HashSet;
+ use std::sync::Arc;
+ use tauri::{AppHandle, Emitter, Manager, State};
+ 
+@@ -27,13 +28,71 @@ pub async fn get_model_info(
+ #[tauri::command]
+ #[specta::specta]
+ pub async fn rescan_local_models(
++    app_handle: AppHandle,
+     model_manager: State<'_, Arc<ModelManager>>,
+ ) -> Result<(), String> {
+     let mm = model_manager.inner().clone();
+     tokio::task::spawn_blocking(move || mm.rescan_local_models())
+         .await
+         .map_err(|e| format!("rescan task panicked: {e}"))?
+-        .map_err(|e| e.to_string())
++        .map_err(|e| e.to_string())?;
++
++    reconcile_shortcut_model_pins(&app_handle)?;
++    Ok(())
++}
++
++fn reconcile_shortcut_model_pins(app: &AppHandle) -> Result<(), String> {
++    let model_manager = app.state::<Arc<ModelManager>>();
++    let downloaded: HashSet<String> = model_manager
++        .get_available_models()
++        .into_iter()
++        .filter(|model| model.is_downloaded)
++        .map(|model| model.id)
++        .collect();
++
++    let mut settings = get_settings(app);
++    let fallback = if downloaded.contains(&settings.selected_model) {
++        settings.selected_model.clone()
++    } else {
++        downloaded.iter().next().cloned().unwrap_or_default()
++    };
++
++    let invalid_primary = !settings.primary_shortcut_model.is_empty()
++        && !downloaded.contains(&settings.primary_shortcut_model);
++    let invalid_secondary = !settings.secondary_shortcut_model.is_empty()
++        && !downloaded.contains(&settings.secondary_shortcut_model);
++
++    if !invalid_primary && !invalid_secondary {
++        return Ok(());
++    }
++
++    if invalid_secondary {
++        if let Some(binding) = settings.bindings.get("transcribe_secondary").cloned() {
++            crate::shortcut::unregister_shortcut(app, binding).map_err(|error| {
++                format!(
++                    "Failed to unregister secondary shortcut while clearing unavailable model: {}",
++                    error
++                )
++            })?;
++        }
++        settings.secondary_shortcut_model.clear();
++    }
++
++    if invalid_primary {
++        settings.primary_shortcut_model = fallback;
++    }
++
++    write_settings(app, settings.clone());
++    let _ = app.emit(
++        "settings-changed",
++        serde_json::json!({
++            "setting": "shortcut_models",
++            "primary_shortcut_model": settings.primary_shortcut_model,
++            "secondary_shortcut_model": settings.secondary_shortcut_model,
++        }),
++    );
++    let _ = app.emit("models-updated", ());
++    Ok(())
+ }
+ 
+ #[tauri::command]
+@@ -69,21 +128,55 @@ pub async fn delete_model(
      transcription_manager: State<'_, Arc<TranscriptionManager>>,
      model_id: String,
  ) -> Result<(), String> {
@@ -111,7 +192,7 @@ index b1bb894..9606a7c 100644
  }
  
  /// Shared logic for switching the active model, used by both the Tauri command
-@@ -93,6 +127,57 @@ pub async fn delete_model(
+@@ -93,6 +186,57 @@ pub async fn delete_model(
  /// unless the unload timeout is set to "Immediately" (in which case the model
  /// will be loaded on-demand during the next transcription).
  pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String> {
@@ -169,7 +250,7 @@ index b1bb894..9606a7c 100644
      let model_manager = app.state::<Arc<ModelManager>>();
      let transcription_manager = app.state::<Arc<TranscriptionManager>>();
  
-@@ -115,12 +200,16 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
+@@ -115,12 +259,16 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
      let settings = get_settings(app);
      let unload_timeout = settings.model_unload_timeout;
      let old_model = settings.selected_model.clone();
@@ -186,7 +267,7 @@ index b1bb894..9606a7c 100644
      settings.onboarding_completed = true;
  
      write_settings(app, settings);
-@@ -150,6 +239,7 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
+@@ -150,6 +298,7 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
      if let Err(e) = transcription_manager.load_model(model_id) {
          let mut settings = get_settings(app);
          settings.selected_model = old_model;
@@ -206,6 +287,19 @@ index 898770b..bfacd85 100644
              shortcut::change_audio_feedback_setting,
              shortcut::change_audio_feedback_volume_setting,
              shortcut::change_sound_theme_setting,
+diff --git a/src-tauri/src/secure_input.rs b/src-tauri/src/secure_input.rs
+index 2201dba..1e214c3 100644
+--- a/src-tauri/src/secure_input.rs
++++ b/src-tauri/src/secure_input.rs
+@@ -480,7 +480,7 @@ mod imp {
+                 if id == "cancel" && !state.cancel_requested.load(Ordering::SeqCst) {
+                     continue;
+                 }
+-                if id == "transcribe_with_post_process" && !settings.post_process_enabled {
++                if id != "cancel" && !crate::shortcut::binding_should_be_registered(&settings, id) {
+                     continue;
+                 }
+ 
 diff --git a/src-tauri/src/settings.rs b/src-tauri/src/settings.rs
 index bd4ecbd..79dcdbf 100644
 --- a/src-tauri/src/settings.rs
@@ -251,44 +345,129 @@ index bd4ecbd..79dcdbf 100644
          always_on_microphone: false,
          selected_microphone: None,
 diff --git a/src-tauri/src/shortcut/handy_keys.rs b/src-tauri/src/shortcut/handy_keys.rs
-index a3131cb..226a7f8 100644
+index a3131cb..0c3126c 100644
 --- a/src-tauri/src/shortcut/handy_keys.rs
 +++ b/src-tauri/src/shortcut/handy_keys.rs
-@@ -437,6 +437,9 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
-         if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
+@@ -433,8 +433,7 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
+         if id == "cancel" {
              continue;
          }
-+        if id == "transcribe_secondary" && user_settings.secondary_shortcut_model.is_empty() {
-+            continue;
-+        }
+-        // Skip post-processing shortcut when the feature is disabled
+-        if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
++        if !super::binding_should_be_registered(&user_settings, &id) {
+             continue;
+         }
  
-         let binding = user_settings
-             .bindings
 diff --git a/src-tauri/src/shortcut/mod.rs b/src-tauri/src/shortcut/mod.rs
-index 607ef52..06f807f 100644
+index 607ef52..496b03c 100644
 --- a/src-tauri/src/shortcut/mod.rs
 +++ b/src-tauri/src/shortcut/mod.rs
-@@ -308,6 +308,9 @@ pub fn resume_all_shortcuts(app: &AppHandle) {
-         if id == "transcribe_with_post_process" && !settings.post_process_enabled {
+@@ -147,6 +147,17 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
+     }
+ }
+ 
++/// Whether a persisted binding should currently own a global registration.
++/// Some bindings stay in settings while their feature is disabled so users can
++/// configure them without activating them.
++pub(crate) fn binding_should_be_registered(settings: &settings::AppSettings, id: &str) -> bool {
++    match id {
++        "transcribe_secondary" => !settings.secondary_shortcut_model.is_empty(),
++        "transcribe_with_post_process" => settings.post_process_enabled,
++        _ => true,
++    }
++}
++
+ // ============================================================================
+ // Binding Management Commands
+ // ============================================================================
+@@ -215,6 +226,23 @@ pub fn change_binding(
+         }
+     }
+ 
++    // Disabled bindings are configuration only. Validate and persist the chord,
++    // but do not claim a global shortcut until the feature is explicitly enabled.
++    if !binding_should_be_registered(&settings, &id) {
++        validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)?;
++
++        let mut updated_binding = binding_to_modify;
++        updated_binding.current_binding = binding;
++        settings.bindings.insert(id, updated_binding.clone());
++        settings::write_settings(&app, settings);
++        crate::secure_input::reconcile_fallback(&app);
++        return Ok(BindingResponse {
++            success: true,
++            binding: Some(updated_binding),
++            error: None,
++        });
++    }
++
+     // Unregister the existing binding
+     if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
+         let error_msg = format!("Failed to unregister shortcut: {}", e);
+@@ -283,11 +311,15 @@ pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, Stri
+ /// mid-capture. The "cancel" binding is untouched: it is managed dynamically
+ /// by the recording lifecycle.
+ pub fn suspend_all_shortcuts(app: &AppHandle) {
+-    for (id, binding) in settings::get_bindings(app) {
++    let settings = settings::get_settings(app);
++    for (id, binding) in &settings.bindings {
+         if id == "cancel" {
              continue;
          }
-+        if id == "transcribe_secondary" && settings.secondary_shortcut_model.is_empty() {
+-        if let Err(e) = unregister_shortcut(app, binding) {
++        if !binding_should_be_registered(&settings, id) {
 +            continue;
 +        }
-         if let Err(e) = register_shortcut(app, binding.clone()) {
-             debug!("resume_all_shortcuts: could not register '{}': {}", id, e);
-         }
-@@ -500,6 +503,9 @@ fn register_all_shortcuts_for_implementation(
-         if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
++        if let Err(e) = unregister_shortcut(app, binding.clone()) {
+             debug!(
+                 "suspend_all_shortcuts: could not unregister '{}': {}",
+                 id, e
+@@ -305,7 +337,7 @@ pub fn resume_all_shortcuts(app: &AppHandle) {
+         if id == "cancel" {
              continue;
          }
-+        if id == "transcribe_secondary" && current_settings.secondary_shortcut_model.is_empty() {
+-        if id == "transcribe_with_post_process" && !settings.post_process_enabled {
++        if !binding_should_be_registered(&settings, id) {
+             continue;
+         }
+         if let Err(e) = register_shortcut(app, binding.clone()) {
+@@ -459,17 +491,22 @@ fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
+ 
+ /// Unregister all shortcuts for the current implementation
+ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementation) {
+-    let bindings = settings::get_bindings(app);
++    let settings = settings::get_settings(app);
+ 
+-    for (id, binding) in bindings {
++    for (id, binding) in &settings.bindings {
+         // Skip cancel shortcut as it's dynamically registered
+         if id == "cancel" {
+             continue;
+         }
++        if !binding_should_be_registered(&settings, id) {
 +            continue;
 +        }
  
-         let mut binding = current_settings
-             .bindings
-@@ -595,6 +601,65 @@ pub fn change_hold_threshold_ms_setting(app: AppHandle, ms: u64) -> Result<(), S
+         let result = match implementation {
+-            KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
+-            KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
++            KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding.clone()),
++            KeyboardImplementation::HandyKeys => {
++                handy_keys::unregister_shortcut(app, binding.clone())
++            }
+         };
+ 
+         if let Err(e) = result {
+@@ -497,7 +534,7 @@ fn register_all_shortcuts_for_implementation(
+         }
+ 
+         // Skip post-processing shortcut when the feature is disabled
+-        if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
++        if !binding_should_be_registered(&current_settings, id) {
+             continue;
+         }
+ 
+@@ -595,6 +632,86 @@ pub fn change_hold_threshold_ms_setting(app: AppHandle, ms: u64) -> Result<(), S
      Ok(())
  }
  
@@ -329,46 +508,143 @@ index 607ef52..06f807f 100644
 +    match id.as_str() {
 +        "transcribe" => settings.primary_shortcut_model = model_id,
 +        "transcribe_secondary" => {
-+            let was_enabled = !settings.secondary_shortcut_model.is_empty();
-+            let will_be_enabled = !model_id.is_empty();
 +            let binding = settings
 +                .bindings
 +                .get("transcribe_secondary")
 +                .cloned()
 +                .ok_or_else(|| "Missing secondary transcription shortcut binding".to_string())?;
-+
-+            if !was_enabled && will_be_enabled {
-+                register_shortcut(&app, binding)?;
-+            } else if was_enabled && !will_be_enabled {
-+                unregister_shortcut(&app, binding)?;
-+            }
-+            settings.secondary_shortcut_model = model_id;
++            apply_secondary_model_change(
++                &mut settings,
++                model_id,
++                || register_shortcut(&app, binding.clone()),
++                || unregister_shortcut(&app, binding.clone()),
++            )?;
 +        }
 +        _ => unreachable!(),
 +    }
 +
 +    settings::write_settings(&app, settings);
++    crate::secure_input::reconcile_fallback(&app);
++    Ok(())
++}
++
++fn apply_secondary_model_change<R, U>(
++    settings: &mut settings::AppSettings,
++    model_id: String,
++    register: R,
++    unregister: U,
++) -> Result<(), String>
++where
++    R: FnOnce() -> Result<(), String>,
++    U: FnOnce() -> Result<(), String>,
++{
++    let was_enabled = !settings.secondary_shortcut_model.is_empty();
++    let will_be_enabled = !model_id.is_empty();
++
++    if !was_enabled && will_be_enabled {
++        register()?;
++    } else if was_enabled && !will_be_enabled {
++        unregister()?;
++    }
++
++    settings.secondary_shortcut_model = model_id;
 +    Ok(())
 +}
 +
  #[tauri::command]
  #[specta::specta]
  pub fn change_audio_feedback_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+@@ -1465,6 +1582,10 @@ pub async fn get_available_accelerators() -> crate::managers::transcription::Ava
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::{
++        apply_secondary_model_change, binding_should_be_registered,
++    };
++    use crate::settings::get_default_settings;
+     use handy_keys::Hotkey;
+     use tauri_plugin_global_shortcut::Shortcut;
+ 
+@@ -1482,4 +1603,64 @@ mod tests {
+             assert!(key.parse::<Hotkey>().is_ok(), "HandyKeys rejected {key}");
+         }
+     }
++
++    #[test]
++    fn empty_secondary_model_keeps_secondary_binding_inactive() {
++        let mut settings = get_default_settings();
++        settings.secondary_shortcut_model.clear();
++        settings
++            .bindings
++            .get_mut("transcribe")
++            .unwrap()
++            .current_binding = "ctrl+alt+space".to_string();
++
++        assert!(binding_should_be_registered(&settings, "transcribe"));
++        assert!(!binding_should_be_registered(
++            &settings,
++            "transcribe_secondary"
++        ));
++    }
++
++    #[test]
++    fn configured_secondary_model_enables_registration() {
++        let mut settings = get_default_settings();
++        settings.secondary_shortcut_model = "model-b".to_string();
++
++        assert!(binding_should_be_registered(
++            &settings,
++            "transcribe_secondary"
++        ));
++    }
++
++    #[test]
++    fn secondary_enable_rolls_back_setting_when_registration_collides() {
++        let mut settings = get_default_settings();
++        settings.secondary_shortcut_model.clear();
++
++        let result = apply_secondary_model_change(
++            &mut settings,
++            "model-b".to_string(),
++            || Err("shortcut collision".to_string()),
++            || Ok(()),
++        );
++
++        assert_eq!(result.unwrap_err(), "shortcut collision");
++        assert!(settings.secondary_shortcut_model.is_empty());
++    }
++
++    #[test]
++    fn secondary_disable_rolls_back_setting_when_unregistration_fails() {
++        let mut settings = get_default_settings();
++        settings.secondary_shortcut_model = "model-b".to_string();
++
++        let result = apply_secondary_model_change(
++            &mut settings,
++            String::new(),
++            || Ok(()),
++            || Err("unregister failed".to_string()),
++        );
++
++        assert_eq!(result.unwrap_err(), "unregister failed");
++        assert_eq!(settings.secondary_shortcut_model, "model-b");
++    }
+ }
 diff --git a/src-tauri/src/shortcut/tauri_impl.rs b/src-tauri/src/shortcut/tauri_impl.rs
-index ee24947..7febbcf 100644
+index ee24947..7339b5b 100644
 --- a/src-tauri/src/shortcut/tauri_impl.rs
 +++ b/src-tauri/src/shortcut/tauri_impl.rs
-@@ -25,6 +25,9 @@ pub fn init_shortcuts(app: &AppHandle) {
-         if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
+@@ -21,8 +21,7 @@ pub fn init_shortcuts(app: &AppHandle) {
+         if id == "cancel" {
+             continue; // Skip cancel shortcut, it will be registered dynamically
+         }
+-        // Skip post-processing shortcut when the feature is disabled
+-        if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
++        if !super::binding_should_be_registered(&user_settings, &id) {
              continue;
          }
-+        if id == "transcribe_secondary" && user_settings.secondary_shortcut_model.is_empty() {
-+            continue;
-+        }
          let binding = user_settings
-             .bindings
-             .get(&id)
-@@ -183,6 +186,7 @@ mod tests {
+@@ -183,6 +182,7 @@ mod tests {
              "option+shift+space",
              "ctrl+space",
              "ctrl+shift+space",

@@ -43,6 +43,7 @@ a94b403e0610049fafa54b0a4077db2945084dd8 and adds:
 - shortcut-driven model selection validates downloaded models and loads them off the coordinator thread;
 - post-process transcription returns to the primary shortcut model after secondary use;
 - deleting a pinned model clears stale shortcut model references.
+- model rescans reconcile pins for models that disappeared outside the app, falling the primary back to the current downloaded model and disabling an invalid secondary binding.
 
 The workflow applies the patch to the pinned upstream commit and validates Rust
 formatting, frontend formatting, translation keys, TypeScript/Vite build,
