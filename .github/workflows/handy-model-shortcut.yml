@@ -190,3 +190,12 @@ jobs:
       - name: Run targeted Rust tests
         working-directory: handy
         run: cargo test --manifest-path src-tauri/Cargo.toml forwarded_model_arg_tests --lib -- --nocapture
+
+      - name: Verify final diff
+        working-directory: handy
+        run: git diff --check
+
+      - name: Print final diff
+        if: always()
+        working-directory: handy
+        run: git diff -- src-tauri/src/cli.rs src-tauri/src/lib.rs README.md
