@@ -73,7 +73,9 @@ jobs:
                           signal_handle::send_transcription_input(app, "transcribe_with_post_process", "CLI");
           '''
           new = r'''            if args.iter().any(|a| a == "--toggle-transcription") {
-                          if let Some(model_id) = forwarded_model_arg(&args).filter(|model_id| {\n                    get_settings(app).selected_model.as_str() != model_id.as_str()\n                }) {
+                          if let Some(model_id) = forwarded_model_arg(&args).filter(|model_id| {
+                    get_settings(app).selected_model.as_str() != model_id.as_str()
+                }) {
                               if let Err(error) = commands::models::switch_active_model(app, &model_id) {
                                   log::error!(
                                       "Failed to switch model '{}' for CLI transcription: {}",
@@ -85,7 +87,9 @@ jobs:
                           }
                           signal_handle::send_transcription_input(app, "transcribe", "CLI");
                       } else if args.iter().any(|a| a == "--toggle-post-process") {
-                          if let Some(model_id) = forwarded_model_arg(&args).filter(|model_id| {\n                    get_settings(app).selected_model.as_str() != model_id.as_str()\n                }) {
+                          if let Some(model_id) = forwarded_model_arg(&args).filter(|model_id| {
+                    get_settings(app).selected_model.as_str() != model_id.as_str()
+                }) {
                               if let Err(error) = commands::models::switch_active_model(app, &model_id) {
                                   log::error!(
                                       "Failed to switch model '{}' for CLI post-processing transcription: {}",
