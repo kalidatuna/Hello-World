@@ -9,7 +9,8 @@ Payer-confirmed terms by email on 2026-10-06:
 - Payment after the payer verifies the accepted build.
 - PayPal is accepted.
 
-This branch validates only the USD 25 runtime/CLI scope.
+This branch now contains both the previously delivered runtime/CLI evidence and
+the remaining USD 25 UI wiring implementation.
 
 ## Implemented behavior
 
@@ -24,8 +25,28 @@ If the requested model cannot be switched successfully, the recording command is
 
 Use `handy --list-models` to discover installed model ids.
 
+## UI wiring added
+
+handy-ui.patch applies to Handy commit
+a94b403e0610049fafa54b0a4077db2945084dd8 and adds:
+
+- a second configurable transcription shortcut in General settings;
+- a model selector for the primary shortcut;
+- a model selector for the secondary shortcut;
+- persisted, independent primary and secondary shortcut model choices;
+- model switching at the actual recording-start boundary, so a secondary
+  shortcut does not redefine the primary shortcut's selected model;
+- normal Handy shortcut activation behavior for both transcription shortcuts;
+- translation keys across every locale so translation-key validation remains
+  consistent.
+
+The workflow applies the patch to the pinned upstream commit and validates Rust
+formatting, frontend formatting, translation keys, TypeScript/Vite build,
+frontend lint, secondary shortcut routing, default shortcut parsing, and
+git diff --check.
+
 ## Scope boundary
 
-This does not claim the remaining USD 25 UI wiring portion of the bounty.
+The remaining USD 25 UI wiring portion is implemented by handy-ui.patch.
 
 The payer asked for the agreement to also be communicated in discussion #746. The current connected GitHub interface available to this campaign does not expose GitHub Discussions write actions, so no discussion comment is claimed.

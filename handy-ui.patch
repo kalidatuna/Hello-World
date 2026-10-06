@@ -1,0 +1,1358 @@
+diff --git a/src-tauri/src/actions.rs b/src-tauri/src/actions.rs
+index cce7cfe..3c947b2 100644
+--- a/src-tauri/src/actions.rs
++++ b/src-tauri/src/actions.rs
+@@ -389,6 +389,26 @@ impl ShortcutAction for TranscribeAction {
+         let start_time = Instant::now();
+         debug!("TranscribeAction::start called for binding: {}", binding_id);
+ 
++        let configured_model = {
++            let settings = get_settings(app);
++            match binding_id {
++                "transcribe" => settings.primary_shortcut_model,
++                "transcribe_secondary" => settings.secondary_shortcut_model,
++                _ => String::new(),
++            }
++        };
++        if !configured_model.is_empty()
++            && get_settings(app).selected_model != configured_model
++            && let Err(error) =
++                crate::commands::models::switch_active_model_for_shortcut(app, &configured_model)
++        {
++            warn!(
++                "Not starting recording: failed to switch '{}' to model '{}': {}",
++                binding_id, configured_model, error
++            );
++            return;
++        }
++
+         // Load model in the background
+         let tm = app.state::<Arc<TranscriptionManager>>();
+         let rm = app.state::<Arc<AudioRecordingManager>>();
+@@ -866,6 +886,12 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
+             post_process: false,
+         }) as Arc<dyn ShortcutAction>,
+     );
++    map.insert(
++        "transcribe_secondary".to_string(),
++        Arc::new(TranscribeAction {
++            post_process: false,
++        }) as Arc<dyn ShortcutAction>,
++    );
+     map.insert(
+         "transcribe_with_post_process".to_string(),
+         Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
+diff --git a/src-tauri/src/commands/models.rs b/src-tauri/src/commands/models.rs
+index b1bb894..7df52ca 100644
+--- a/src-tauri/src/commands/models.rs
++++ b/src-tauri/src/commands/models.rs
+@@ -93,6 +93,20 @@ pub async fn delete_model(
+ /// unless the unload timeout is set to "Immediately" (in which case the model
+ /// will be loaded on-demand during the next transcription).
+ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String> {
++    switch_active_model_impl(app, model_id, true)
++}
++
++/// Switch for a model-bound shortcut without redefining the primary shortcut's
++/// model preference.
++pub fn switch_active_model_for_shortcut(app: &AppHandle, model_id: &str) -> Result<(), String> {
++    switch_active_model_impl(app, model_id, false)
++}
++
++fn switch_active_model_impl(
++    app: &AppHandle,
++    model_id: &str,
++    update_primary_shortcut: bool,
++) -> Result<(), String> {
+     let model_manager = app.state::<Arc<ModelManager>>();
+     let transcription_manager = app.state::<Arc<TranscriptionManager>>();
+ 
+@@ -115,12 +129,16 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
+     let settings = get_settings(app);
+     let unload_timeout = settings.model_unload_timeout;
+     let old_model = settings.selected_model.clone();
++    let old_primary_shortcut_model = settings.primary_shortcut_model.clone();
+     let old_onboarding_completed = settings.onboarding_completed;
+ 
+     // Persist the new selection early so the frontend sees the correct model
+     // when it reacts to events emitted by load_model.
+     let mut settings = settings;
+     settings.selected_model = model_id.to_string();
++    if update_primary_shortcut {
++        settings.primary_shortcut_model = model_id.to_string();
++    }
+     settings.onboarding_completed = true;
+ 
+     write_settings(app, settings);
+@@ -150,6 +168,7 @@ pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String
+     if let Err(e) = transcription_manager.load_model(model_id) {
+         let mut settings = get_settings(app);
+         settings.selected_model = old_model;
++        settings.primary_shortcut_model = old_primary_shortcut_model;
+         settings.onboarding_completed = old_onboarding_completed;
+         write_settings(app, settings);
+         return Err(e.to_string());
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 898770b..bfacd85 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -653,6 +653,7 @@ pub fn run(cli_args: CliArgs) {
+             shortcut::reset_binding,
+             shortcut::change_shortcut_activation_setting,
+             shortcut::change_hold_threshold_ms_setting,
++            shortcut::change_shortcut_model_setting,
+             shortcut::change_audio_feedback_setting,
+             shortcut::change_audio_feedback_volume_setting,
+             shortcut::change_sound_theme_setting,
+diff --git a/src-tauri/src/settings.rs b/src-tauri/src/settings.rs
+index bd4ecbd..79dcdbf 100644
+--- a/src-tauri/src/settings.rs
++++ b/src-tauri/src/settings.rs
+@@ -413,6 +413,13 @@ pub struct AppSettings {
+     pub whats_new_last_seen_version: String,
+     #[serde(default = "default_model")]
+     pub selected_model: String,
++    /// Model pinned to the primary transcription shortcut. Empty means follow
++    /// the current selected model until the user explicitly chooses one.
++    #[serde(default)]
++    pub primary_shortcut_model: String,
++    /// Model pinned to the secondary transcription shortcut.
++    #[serde(default)]
++    pub secondary_shortcut_model: String,
+     #[serde(default)]
+     pub onboarding_completed: bool,
+     #[serde(default = "default_always_on_microphone")]
+@@ -907,6 +914,16 @@ pub fn get_default_settings() -> AppSettings {
+     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+     let default_post_process_shortcut = "alt+shift+space";
+ 
++    bindings.insert(
++        "transcribe_secondary".to_string(),
++        ShortcutBinding {
++            id: "transcribe_secondary".to_string(),
++            name: "Secondary Transcribe Shortcut".to_string(),
++            description: "Records and transcribes using its own configured model.".to_string(),
++            default_binding: "ctrl+alt+space".to_string(),
++            current_binding: "ctrl+alt+space".to_string(),
++        },
++    );
+     bindings.insert(
+         "transcribe_with_post_process".to_string(),
+         ShortcutBinding {
+@@ -943,6 +960,8 @@ pub fn get_default_settings() -> AppSettings {
+         show_whats_new_on_update: default_show_whats_new_on_update(),
+         whats_new_last_seen_version: default_whats_new_last_seen_version(),
+         selected_model: "".to_string(),
++        primary_shortcut_model: "".to_string(),
++        secondary_shortcut_model: "".to_string(),
+         onboarding_completed: false,
+         always_on_microphone: false,
+         selected_microphone: None,
+diff --git a/src-tauri/src/shortcut/mod.rs b/src-tauri/src/shortcut/mod.rs
+index 607ef52..d996269 100644
+--- a/src-tauri/src/shortcut/mod.rs
++++ b/src-tauri/src/shortcut/mod.rs
+@@ -595,6 +595,35 @@ pub fn change_hold_threshold_ms_setting(app: AppHandle, ms: u64) -> Result<(), S
+     Ok(())
+ }
+ 
++#[tauri::command]
++#[specta::specta]
++pub fn change_shortcut_model_setting(
++    app: AppHandle,
++    id: String,
++    model_id: String,
++) -> Result<(), String> {
++    if !matches!(id.as_str(), "transcribe" | "transcribe_secondary") {
++        return Err(format!(
++            "Shortcut '{}' cannot select a transcription model",
++            id
++        ));
++    }
++
++    let mut settings = settings::get_settings(&app);
++    if settings.primary_shortcut_model.is_empty() {
++        settings.primary_shortcut_model = settings.selected_model.clone();
++    }
++
++    match id.as_str() {
++        "transcribe" => settings.primary_shortcut_model = model_id,
++        "transcribe_secondary" => settings.secondary_shortcut_model = model_id,
++        _ => unreachable!(),
++    }
++
++    settings::write_settings(&app, settings);
++    Ok(())
++}
++
+ #[tauri::command]
+ #[specta::specta]
+ pub fn change_audio_feedback_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+diff --git a/src-tauri/src/shortcut/tauri_impl.rs b/src-tauri/src/shortcut/tauri_impl.rs
+index ee24947..99a6363 100644
+--- a/src-tauri/src/shortcut/tauri_impl.rs
++++ b/src-tauri/src/shortcut/tauri_impl.rs
+@@ -183,6 +183,7 @@ mod tests {
+             "option+shift+space",
+             "ctrl+space",
+             "ctrl+shift+space",
++            "ctrl+alt+space",
+             "alt+space",
+             "escape",
+         ] {
+diff --git a/src-tauri/src/transcription_coordinator.rs b/src-tauri/src/transcription_coordinator.rs
+index a35bff3..775746a 100644
+--- a/src-tauri/src/transcription_coordinator.rs
++++ b/src-tauri/src/transcription_coordinator.rs
+@@ -535,7 +535,10 @@ pub struct TranscriptionCoordinator {
+ }
+ 
+ pub fn is_transcribe_binding(id: &str) -> bool {
+-    id == "transcribe" || id == "transcribe_with_post_process"
++    matches!(
++        id,
++        "transcribe" | "transcribe_secondary" | "transcribe_with_post_process"
++    )
+ }
+ 
+ impl TranscriptionCoordinator {
+@@ -713,6 +716,14 @@ fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn secondary_binding_uses_transcription_coordinator() {
++        assert!(is_transcribe_binding("transcribe_secondary"));
++        assert!(is_transcribe_binding("transcribe"));
++        assert!(is_transcribe_binding("transcribe_with_post_process"));
++        assert!(!is_transcribe_binding("cancel"));
++    }
++
+     #[test]
+     fn push_to_talk_release_while_recording_defers_release() {
+         assert_eq!(
+diff --git a/src/bindings.ts b/src/bindings.ts
+index 1d8fc9a..18c6e2d 100644
+--- a/src/bindings.ts
++++ b/src/bindings.ts
+@@ -21,6 +21,14 @@ async resetBinding(id: string) : Promise<Result<BindingResponse, string>> {
+     else return { status: "error", error: e  as any };
+ }
+ },
++async changeShortcutModelSetting(id: string, modelId: string) : Promise<Result<null, string>> {
++    try {
++    return { status: "ok", data: await TAURI_INVOKE("change_shortcut_model_setting", { id, modelId }) };
++} catch (e) {
++    if(e instanceof Error) throw e;
++    else return { status: "error", error: e  as any };
++}
++},
+ async changeShortcutActivationSetting(activation: ShortcutActivation) : Promise<Result<null, string>> {
+     try {
+     return { status: "ok", data: await TAURI_INVOKE("change_shortcut_activation_setting", { activation }) };
+@@ -477,7 +485,7 @@ async changeTranscribeGpuDevice(device: string | null) : Promise<Result<null, st
+ },
+ /**
+  * Return which accelerators and GPU devices are available for this build.
+- * 
++ *
+  * First-call cost is dominated by enumerating GPU devices through the
+  * transcribe.cpp Metal/Vulkan backend, which loads dynamic libraries and
+  * probes hardware. Run it on the blocking pool so the webview thread
+@@ -917,7 +925,7 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
+ },
+ /**
+  * Checks if the Mac is a laptop by detecting battery presence
+- * 
++ *
+  * This uses pmset to check for battery information.
+  * Returns true if a battery is detected (laptop), false otherwise (desktop)
+  */
+@@ -957,61 +965,61 @@ streamTextEvent: "stream-text-event"
+  * object, so a partial store can never fail the whole load (#1619).
+  * Field-level defaults below take precedence where present.
+  */
+-export type AppSettings = { 
++export type AppSettings = {
+ /**
+  * Internal settings schema marker for one-time migrations. Fresh installs
+  * start at the current version; existing stores missing this key are
+  * treated as version 0 and migrated forward.
+  */
+-settings_schema_version?: number; 
++settings_schema_version?: number;
+ /**
+  * Defaults to empty on partial stores; the load path merges in the
+  * default bindings for any missing keys before the settings are used.
+  */
+-bindings?: Partial<{ [key in string]: ShortcutBinding }>; 
++bindings?: Partial<{ [key in string]: ShortcutBinding }>;
+ /**
+  * Replaces the pre-0.10 `push_to_talk` bool; stores missing this key are
+  * migrated from it in `apply_settings_migrations`.
+  */
+-shortcut_activation?: ShortcutActivation; 
++shortcut_activation?: ShortcutActivation;
+ /**
+  * Hold-or-toggle only: a press held at least this long is push-to-talk,
+  * anything shorter is a tap that locks recording on.
+  */
+-hold_threshold_ms?: number; audio_feedback?: boolean; audio_feedback_volume?: number; sound_theme?: SoundTheme; start_hidden?: boolean; autostart_enabled?: boolean; update_checks_enabled?: boolean; show_whats_new_on_update?: boolean; 
++hold_threshold_ms?: number; audio_feedback?: boolean; audio_feedback_volume?: number; sound_theme?: SoundTheme; start_hidden?: boolean; autostart_enabled?: boolean; update_checks_enabled?: boolean; show_whats_new_on_update?: boolean;
+ /**
+  * The app version whose What's New the user has already seen. Fresh installs
+  * default to the current version (nothing is "new" to them). Existing users
+  * upgrading from before this key existed are blanked by the migration so they
+  * see the current release's notes — see `apply_settings_migrations`.
+  */
+-whats_new_last_seen_version?: string; selected_model?: string; onboarding_completed?: boolean; always_on_microphone?: boolean; selected_microphone?: string | null; 
++whats_new_last_seen_version?: string; selected_model?: string; primary_shortcut_model?: string; secondary_shortcut_model?: string; onboarding_completed?: boolean; always_on_microphone?: boolean; selected_microphone?: string | null;
+ /**
+  * Which input channel to use on the selected microphone device.
+  * None means "average all channels" (original behavior).
+  */
+-selected_channel?: number | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; paste_delay_ms?: number; paste_delay_after_ms?: number; 
++selected_channel?: number | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; paste_delay_ms?: number; paste_delay_after_ms?: number;
+ /**
+  * Debug-gated ("beta") receipt-sequenced paste: restore the clipboard only
+  * after the target app actually reads the transcript, instead of after a
+  * fixed delay. See `paste_tx`. macOS and Windows only.
+  */
+-reliable_paste?: boolean; typing_tool?: TypingTool; external_script_path?: string | null; filler_word_removal_enabled?: boolean; custom_filler_words?: string[] | null; 
++reliable_paste?: boolean; typing_tool?: TypingTool; external_script_path?: string | null; filler_word_removal_enabled?: boolean; custom_filler_words?: string[] | null;
+ /**
+  * Fresh installs default from the OS locale; existing stores are migrated
+  * in `apply_settings_migrations`.
+  */
+-chinese_script?: ChineseScript; transcribe_accelerator?: TranscribeAcceleratorSetting; ort_accelerator?: OrtAcceleratorSetting; 
++chinese_script?: ChineseScript; transcribe_accelerator?: TranscribeAcceleratorSetting; ort_accelerator?: OrtAcceleratorSetting;
+ /**
+  * Stable transcribe.cpp device selector. This is derived from the backend's
+  * `device_id` when available (or its name for backends such as Metal),
+  * never from the process-local device registry index.
+  */
+-transcribe_gpu_device?: string | null; extra_recording_buffer_ms?: number; vad_enabled?: boolean; 
++transcribe_gpu_device?: string | null; extra_recording_buffer_ms?: number; vad_enabled?: boolean;
+ /**
+  * Experimental detector implementation. Silero remains the stable default.
+  */
+-vad_backend?: VadBackend; 
++vad_backend?: VadBackend;
+ /**
+  * Which recording overlay to show: None / Minimal / Live. Streaming mode is
+  * not gated on this — that follows model capability. Migrated from the old
+@@ -1026,14 +1034,14 @@ export type BindingResponse = { success: boolean; binding: ShortcutBinding | nul
+  * Script applied to Mandarin and Cantonese output. Other languages are never
+  * converted.
+  */
+-export type ChineseScript = 
++export type ChineseScript =
+ /**
+  * Keep whatever script the model produced.
+  */
+ "as_transcribed" | "simplified" | "traditional"
+ export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
+ export type CustomSounds = { start: boolean; stop: boolean }
+-export type EngineType = 
++export type EngineType =
+ /**
+  * Any GGML/GGUF model loaded through transcribe-cpp (Whisper, Parakeet,
+  * Voxtral, Qwen3-ASR, Nemotron, …). The architecture is auto-detected from
+@@ -1046,12 +1054,12 @@ export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | {
+ /**
+  * Result of changing keyboard implementation
+  */
+-export type ImplementationChangeResult = { success: boolean; 
++export type ImplementationChangeResult = { success: boolean;
+ /**
+  * List of binding IDs that were reset to defaults due to incompatibility
+  */
+ reset_bindings: string[] }
+-export type KeyboardDiagnosticReport = { secure_input_enabled: boolean; culprit_pid: number | null; culprit_name: string | null; 
++export type KeyboardDiagnosticReport = { secure_input_enabled: boolean; culprit_pid: number | null; culprit_name: string | null;
+ /**
+  * Counts only — key identity is deliberately never captured.
+  */
+@@ -1065,21 +1073,21 @@ export type ModelLoadStatus = { is_loaded: boolean; current_model: string | null
+  * Where a model comes from and how Handy obtains it — the routing discriminant
+  * for downloading and on-disk resolution.
+  */
+-export type ModelSource = 
++export type ModelSource =
+ /**
+  * Direct HTTP download from a URL (current blob.handy.computer hosting).
+  */
+-{ Url: { url: string; 
++{ Url: { url: string;
+ /**
+  * Expected SHA-256 for integrity verification; `None` skips it.
+  */
+-sha256: string | null } } | 
++sha256: string | null } } |
+ /**
+  * A file inside a Hugging Face Hub repo, fetched via hf-hub into the shared
+  * HF cache (so other tools reuse it). The file within the repo is
+  * [`ModelInfo::filename`].
+  */
+-{ HuggingFace: { repo_id: string; revision: string } } | 
++{ HuggingFace: { repo_id: string; revision: string } } |
+ /**
+  * Already present on disk — a user-provided custom model, or one discovered
+  * in a shared cache. Nothing to download.
+@@ -1101,32 +1109,32 @@ export type PermissionAccess = "allowed" | "denied" | "unknown"
+ export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
+ export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
+ export type SecretMap = Partial<{ [key in string]: string }>
+-export type SecureInputStatus = { 
++export type SecureInputStatus = {
+ /**
+  * Secure input is currently enabled (live check)
+  */
+-enabled: boolean; 
++enabled: boolean;
+ /**
+  * Enabled continuously long enough to be considered stuck (not just a
+  * password field gaining momentary focus)
+  */
+-sustained: boolean; culprit_pid: number | null; culprit_name: string | null; 
++sustained: boolean; culprit_pid: number | null; culprit_name: string | null;
+ /**
+  * Carbon fallback registrations are currently active
+  */
+-fallback_active: boolean; 
++fallback_active: boolean;
+ /**
+  * Binding ids shadow-registered with identical semantics
+  */
+-covered_bindings: string[]; 
++covered_bindings: string[];
+ /**
+  * Side-specific binding ids widened to match either side while shadowed
+  */
+-degraded_bindings: string[]; 
++degraded_bindings: string[];
+ /**
+  * Binding ids that cannot fire at all (e.g. fn+key, registration failure)
+  */
+-uncovered_bindings: string[]; 
++uncovered_bindings: string[];
+ /**
+  * The user tried to record a shortcut while secure input was active.
+  * Treated as user impact even when every binding is covered, so the
+@@ -1136,15 +1144,15 @@ recorder_blocked: boolean }
+ /**
+  * How the transcribe shortcut's key events drive a recording.
+  */
+-export type ShortcutActivation = 
++export type ShortcutActivation =
+ /**
+  * Press to start, press again to stop.
+  */
+-"toggle" | 
++"toggle" |
+ /**
+  * Hold to record, release to stop.
+  */
+-"push_to_talk" | 
++"push_to_talk" |
+ /**
+  * Hold to record and release to stop, or tap to keep recording until the
+  * next press. Which one it was is decided by how long the key was held
+@@ -1156,13 +1164,13 @@ export type SoundTheme = "marimba" | "pop" | "custom"
+ /**
+  * Phase of the streaming overlay card, emitted to drive its UI state.
+  */
+-export type StreamPhase = 
++export type StreamPhase =
+ /**
+  * Receiving audio / live text (or waiting for the stream to begin). Rust
+  * does not emit this today; the frontend starts in this phase and Rust only
+  * emits transitions away from it.
+  */
+-"listening" | 
++"listening" |
+ /**
+  * Finalizing or post-processing — show a spinner.
+  */
+@@ -1170,7 +1178,7 @@ export type StreamPhase =
+ /**
+  * Emitted to switch the streaming overlay to a working spinner.
+  */
+-export type StreamPhaseEvent = { phase: StreamPhase; 
++export type StreamPhaseEvent = { phase: StreamPhase;
+ /**
+  * Present only when `phase` is `Working`.
+  */
+diff --git a/src/components/settings/general/GeneralSettings.tsx b/src/components/settings/general/GeneralSettings.tsx
+index 7318236..6477044 100644
+--- a/src/components/settings/general/GeneralSettings.tsx
++++ b/src/components/settings/general/GeneralSettings.tsx
+@@ -12,6 +12,7 @@ import { useSettings } from "../../../hooks/useSettings";
+ import { VolumeSlider } from "../VolumeSlider";
+ import { MuteWhileRecording } from "../MuteWhileRecording";
+ import { ModelSettingsCard } from "./ModelSettingsCard";
++import { ShortcutModelSelector } from "../ShortcutModelSelector";
+ 
+ export const GeneralSettings: React.FC = () => {
+   const { t } = useTranslation();
+@@ -21,6 +22,12 @@ export const GeneralSettings: React.FC = () => {
+     <div className="max-w-3xl w-full mx-auto space-y-6">
+       <SettingsGroup title={t("settings.general.title")}>
+         <ShortcutInput shortcutId="transcribe" grouped={true} />
++        <ShortcutModelSelector shortcutId="transcribe" grouped={true} />
++        <ShortcutInput shortcutId="transcribe_secondary" grouped={true} />
++        <ShortcutModelSelector
++          shortcutId="transcribe_secondary"
++          grouped={true}
++        />
+         <ShortcutActivationSetting descriptionMode="tooltip" grouped={true} />
+         {/* Cancel shortcut remains hidden on Linux because of dynamic shortcut instability. */}
+         {!isLinux && <ShortcutInput shortcutId="cancel" grouped={true} />}
+diff --git a/src/i18n/locales/ar/translation.json b/src/i18n/locales/ar/translation.json
+index cb816a4..a6bf4a4 100644
+--- a/src/i18n/locales/ar/translation.json
++++ b/src/i18n/locales/ar/translation.json
+@@ -176,12 +176,27 @@
+           "transcribe_with_post_process": {
+             "name": "مفتاح المعالجة اللاحقة",
+             "description": "اختياري: مفتاح اختصار مخصص يطبق دائماً المعالجة اللاحقة بالذكاء الاصطناعي على التفريغ الصوتي."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "فشل استعادة الاختصار الأصلي",
+           "set": "فشل تعيين الاختصار: {{error}}",
+           "reset": "فشل إعادة تعيين الاختصار إلى قيمته الأصلية"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/bg/translation.json b/src/i18n/locales/bg/translation.json
+index 6c79810..5f08cd0 100644
+--- a/src/i18n/locales/bg/translation.json
++++ b/src/i18n/locales/bg/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Бърз клавиш за постобработка",
+             "description": "По избор: отделна комбинация, която винаги прилага ИИ постобработка върху транскрипцията."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Неуспешно възстановяване на оригиналния бърз клавиш",
+           "set": "Неуспешно задаване на бързия клавиш: {{error}}",
+           "reset": "Неуспешно нулиране на бързия клавиш към първоначалната стойност"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/ca/translation.json b/src/i18n/locales/ca/translation.json
+index 4685baf..670672f 100644
+--- a/src/i18n/locales/ca/translation.json
++++ b/src/i18n/locales/ca/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Drecera de postprocessament",
+             "description": "Opcional: una drecera específica que sempre aplica postprocessament amb IA a la transcripció."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "No s'ha pogut restaurar la drecera original",
+           "set": "No s'ha pogut definir la drecera: {{error}}",
+           "reset": "No s'ha pogut restablir la drecera al valor original"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/cs/translation.json b/src/i18n/locales/cs/translation.json
+index a7e327c..8158576 100644
+--- a/src/i18n/locales/cs/translation.json
++++ b/src/i18n/locales/cs/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Klávesa pro následné zpracování",
+             "description": "Volitelné: Vyhrazená klávesová zkratka, která vždy použije AI následné zpracování na váš přepis."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Nepodařilo se obnovit původní zkratku",
+           "set": "Nepodařilo se nastavit zkratku: {{error}}",
+           "reset": "Nepodařilo se vrátit zkratku na původní hodnotu"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/da/translation.json b/src/i18n/locales/da/translation.json
+index 10a0dd0..64d823f 100644
+--- a/src/i18n/locales/da/translation.json
++++ b/src/i18n/locales/da/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Genvej til efterbehandling",
+             "description": "Valgfrit: En dedikeret genvej, der altid anvender AI-efterbehandling på din transskription."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Kunne ikke gendanne den oprindelige genvej",
+           "set": "Kunne ikke indstille genvej: {{error}}",
+           "reset": "Kunne ikke nulstille genvej til oprindelig indstilling"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/de/translation.json b/src/i18n/locales/de/translation.json
+index f159a77..2645613 100644
+--- a/src/i18n/locales/de/translation.json
++++ b/src/i18n/locales/de/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Nachbearbeitungs-Tastenkürzel",
+             "description": "Optional: Ein dediziertes Tastenkürzel, das immer die KI-Nachbearbeitung auf deine Transkription anwendet."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Ursprüngliches Tastenkürzel konnte nicht wiederhergestellt werden",
+           "set": "Tastenkürzel konnte nicht gesetzt werden: {{error}}",
+           "reset": "Tastenkürzel konnte nicht auf Originalwert zurückgesetzt werden"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/en/translation.json b/src/i18n/locales/en/translation.json
+index 440ebac..986e16e 100644
+--- a/src/i18n/locales/en/translation.json
++++ b/src/i18n/locales/en/translation.json
+@@ -172,6 +172,10 @@
+             "name": "Transcribe Shortcut",
+             "description": "The keyboard shortcut to record and transcribe your voice."
+           },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
++          },
+           "cancel": {
+             "name": "Cancel Shortcut",
+             "description": "The keyboard shortcut to cancel the current recording."
+@@ -181,6 +185,17 @@
+             "description": "Optional: A dedicated hotkey that always applies AI post-processing to your transcription."
+           }
+         },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
++        },
+         "errors": {
+           "restore": "Failed to restore original shortcut",
+           "set": "Failed to set shortcut: {{error}}",
+diff --git a/src/i18n/locales/es/translation.json b/src/i18n/locales/es/translation.json
+index 9fb2be1..5705a6b 100644
+--- a/src/i18n/locales/es/translation.json
++++ b/src/i18n/locales/es/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Tecla de post procesamiento",
+             "description": "Opcional: Una tecla de acceso rápido dedicada que siempre aplica post procesamiento con IA a tu transcripción."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Error al restaurar el atajo original",
+           "set": "Error al configurar el atajo: {{error}}",
+           "reset": "Error al restablecer el atajo al valor original"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/fr/translation.json b/src/i18n/locales/fr/translation.json
+index d2a5904..60e808f 100644
+--- a/src/i18n/locales/fr/translation.json
++++ b/src/i18n/locales/fr/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Raccourci de post-traitement",
+             "description": "Facultatif : Un raccourci dédié qui applique toujours le post-traitement IA à votre transcription."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Échec de la restauration du raccourci original",
+           "set": "Échec de la définition du raccourci : {{error}}",
+           "reset": "Échec de la réinitialisation du raccourci à sa valeur d'origine"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/he/translation.json b/src/i18n/locales/he/translation.json
+index ecd4362..a51b6cb 100644
+--- a/src/i18n/locales/he/translation.json
++++ b/src/i18n/locales/he/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "קיצור לעיבוד משלים",
+             "description": "אופציונלי: קיצור מקשים ייעודי שתמיד מפעיל עיבוד AI על התמלול."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "שחזור קיצור הדרך המקורי נכשל",
+           "set": "הגדרת קיצור הדרך נכשלה: {{error}}",
+           "reset": "איפוס קיצור הדרך לערך המקורי נכשל"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/hi/translation.json b/src/i18n/locales/hi/translation.json
+index 50b5041..322ffcf 100644
+--- a/src/i18n/locales/hi/translation.json
++++ b/src/i18n/locales/hi/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "पोस्ट-प्रोसेसिंग हॉटकी",
+             "description": "वैकल्पिक: एक अलग हॉटकी जो आपके ट्रांसक्रिप्शन पर हमेशा AI पोस्ट-प्रोसेसिंग लागू करती है."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "पहले वाला शॉर्टकट वापस नहीं लाया जा सका",
+           "set": "शॉर्टकट सेट नहीं हो सका: {{error}}",
+           "reset": "शॉर्टकट को पहले जैसा रीसेट नहीं किया जा सका"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/id/translation.json b/src/i18n/locales/id/translation.json
+index 43fc1d9..2e784fa 100644
+--- a/src/i18n/locales/id/translation.json
++++ b/src/i18n/locales/id/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Pintasan Pascaproses",
+             "description": "Opsional: pintasan khusus yang selalu menerapkan pascaproses AI pada transkripsi Anda."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Gagal memulihkan pintasan asli",
+           "set": "Gagal mengatur pintasan: {{error}}",
+           "reset": "Gagal mengembalikan pintasan ke nilai awal"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/it/translation.json b/src/i18n/locales/it/translation.json
+index 59a29f5..ec09c87 100644
+--- a/src/i18n/locales/it/translation.json
++++ b/src/i18n/locales/it/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Tasto di post-elaborazione",
+             "description": "Facoltativo: Un tasto di scelta rapida dedicato che applica sempre la post-elaborazione IA alla trascrizione."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Errore nel ripristino della scorciatoia originale",
+           "set": "Errore nella configurazione della scorciatoia: {{error}}",
+           "reset": "Errore nella reinizializzazione della scorciatoia al valore originale"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/ja/translation.json b/src/i18n/locales/ja/translation.json
+index ba02949..04bf49d 100644
+--- a/src/i18n/locales/ja/translation.json
++++ b/src/i18n/locales/ja/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "後処理のショートカット",
+             "description": "文字起こしに常に AI 後処理を適用するキーボードショートカット。 (任意)"
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "元のショートカットを復元できませんでした",
+           "set": "ショートカットを設定できませんでした: {{error}}",
+           "reset": "ショートカットを元の値にリセットできませんでした"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/ko/translation.json b/src/i18n/locales/ko/translation.json
+index 8f5130b..a82c8c0 100644
+--- a/src/i18n/locales/ko/translation.json
++++ b/src/i18n/locales/ko/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "후처리 단축키",
+             "description": "선택 사항: 항상 AI 후처리를 적용하는 전용 단축키입니다."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "원래 단축키 복원에 실패했습니다",
+           "set": "단축키 설정 실패: {{error}}",
+           "reset": "단축키를 원래 값으로 재설정하는데 실패했습니다"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/ne/translation.json b/src/i18n/locales/ne/translation.json
+index c8949d6..66ca7e5 100644
+--- a/src/i18n/locales/ne/translation.json
++++ b/src/i18n/locales/ne/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "पोस्ट-प्रोसेसिङ हटकी",
+             "description": "वैकल्पिक: तपाईंको ट्रान्सक्रिप्सनमा सधैँ AI पोस्ट-प्रोसेसिङ लागू गर्ने छुट्टै हटकी।"
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "मूल सर्टकट पुनर्स्थापना गर्न सकिएन",
+           "set": "सर्टकट सेट गर्न सकिएन: {{error}}",
+           "reset": "सर्टकटलाई मूल मानमा रिसेट गर्न सकिएन"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/nl/translation.json b/src/i18n/locales/nl/translation.json
+index c50e93f..12f839e 100644
+--- a/src/i18n/locales/nl/translation.json
++++ b/src/i18n/locales/nl/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Sneltoets voor naverwerking",
+             "description": "Optioneel: Een specifieke sneltoets die altijd AI-naverwerking toepast op je transcriptie."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Herstellen van originele sneltoets mislukt",
+           "set": "Instellen van sneltoets mislukt: {{error}}",
+           "reset": "Sneltoets terugzetten naar standaardwaarde mislukt"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/pl/translation.json b/src/i18n/locales/pl/translation.json
+index 24d7ebe..c343c7c 100644
+--- a/src/i18n/locales/pl/translation.json
++++ b/src/i18n/locales/pl/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Skrót postprocessingu",
+             "description": "Opcjonalnie: Dedykowany skrót klawiszowy, który zawsze stosuje postprocessing AI do transkrypcji."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Nie udało się przywrócić oryginalnego skrótu",
+           "set": "Nie udało się ustawić skrótu: {{error}}",
+           "reset": "Nie udało się zresetować skrótu do wartości domyślnej"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/pt/translation.json b/src/i18n/locales/pt/translation.json
+index 0932d46..0244133 100644
+--- a/src/i18n/locales/pt/translation.json
++++ b/src/i18n/locales/pt/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Tecla de Pós-Processamento",
+             "description": "Opcional: Uma tecla de atalho dedicada que sempre aplica pós-processamento com IA à sua transcrição."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Falha ao restaurar atalho original",
+           "set": "Falha ao definir atalho: {{error}}",
+           "reset": "Falha ao redefinir atalho para o valor original"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/ru/translation.json b/src/i18n/locales/ru/translation.json
+index 6cf5fae..0336a69 100644
+--- a/src/i18n/locales/ru/translation.json
++++ b/src/i18n/locales/ru/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Горячая клавиша постобработки",
+             "description": "Специальное сочетание клавиш для ИИ-постобработки вашей транскрипции."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Не удалось восстановить исходный ярлык",
+           "set": "Не удалось установить ярлык: {{error}}",
+           "reset": "Не удалось сбросить ярлык до исходного значения"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/sv/translation.json b/src/i18n/locales/sv/translation.json
+index 2d29ec6..650eb04 100644
+--- a/src/i18n/locales/sv/translation.json
++++ b/src/i18n/locales/sv/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Snabbkommando för efterbearbetning",
+             "description": "Valfritt: En dedikerad snabbknapp som alltid tillämpar AI-efterbearbetning på din transkription."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Misslyckades med att återställa ursprungligt kortkommando",
+           "set": "Misslyckades med att ställa in kortkommando: {{error}}",
+           "reset": "Misslyckades med att återställa kortkommando till ursprungsvärdet"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/tr/translation.json b/src/i18n/locales/tr/translation.json
+index 343ccad..1a03ddb 100644
+--- a/src/i18n/locales/tr/translation.json
++++ b/src/i18n/locales/tr/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Son İşlem Kısayolu",
+             "description": "İsteğe bağlı: Transkripsiyonunuza her zaman yapay zekâ ile son işlem uygulayan özel bir kısayol tuşu."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Orijinal kısayol geri yüklenemedi",
+           "set": "Kısayol ayarlanamadı: {{error}}",
+           "reset": "Kısayol orijinal değerine sıfırlanamadı"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/uk/translation.json b/src/i18n/locales/uk/translation.json
+index ab37f68..f27d75d 100644
+--- a/src/i18n/locales/uk/translation.json
++++ b/src/i18n/locales/uk/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "Гаряча клавіша постобробки",
+             "description": "Необов'язково: Спеціальна гаряча клавіша, яка завжди застосовує AI-постобробку до вашої транскрипції."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Не вдалося відновити початкове скорочення",
+           "set": "Не вдалося встановити скорочення: {{error}}",
+           "reset": "Не вдалося скинути скорочення до початкового значення"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/vi/translation.json b/src/i18n/locales/vi/translation.json
+index 554c400..3aaed46 100644
+--- a/src/i18n/locales/vi/translation.json
++++ b/src/i18n/locales/vi/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "Phím tắt xử lý sau",
+             "description": "Tùy chọn: Phím tắt chuyên dụng luôn áp dụng xử lý sau bằng AI cho bản chuyển đổi của bạn."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "Không thể khôi phục phím tắt gốc",
+           "set": "Không thể đặt phím tắt: {{error}}",
+           "reset": "Không thể đặt lại phím tắt về giá trị gốc"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/zh-TW/translation.json b/src/i18n/locales/zh-TW/translation.json
+index 2bcba31..210ddfd 100644
+--- a/src/i18n/locales/zh-TW/translation.json
++++ b/src/i18n/locales/zh-TW/translation.json
+@@ -179,12 +179,27 @@
+           "transcribe_with_post_process": {
+             "name": "後處理快捷鍵",
+             "description": "可選：專用快捷鍵，使用時一律對轉錄結果套用 AI 後處理"
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "無法還原原始快捷鍵",
+           "set": "無法設定快捷鍵: {{error}}",
+           "reset": "無法將快捷鍵重設為原始值"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/i18n/locales/zh/translation.json b/src/i18n/locales/zh/translation.json
+index b8ec5dc..a2e09f0 100644
+--- a/src/i18n/locales/zh/translation.json
++++ b/src/i18n/locales/zh/translation.json
+@@ -199,12 +199,27 @@
+           "transcribe_with_post_process": {
+             "name": "后处理快捷键",
+             "description": "可选：一个专用快捷键，始终对您的转录应用 AI 后处理。"
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Transcribe Shortcut",
++            "description": "A second transcription shortcut that can use a different model."
+           }
+         },
+         "errors": {
+           "restore": "无法恢复原始快捷键",
+           "set": "无法设置快捷键: {{error}}",
+           "reset": "无法将快捷键重置为原始值"
++        },
++        "shortcutModels": {
++          "chooseModel": "Choose a model",
++          "transcribe": {
++            "name": "Primary Shortcut Model",
++            "description": "The transcription model used by the primary shortcut."
++          },
++          "transcribe_secondary": {
++            "name": "Secondary Shortcut Model",
++            "description": "The transcription model used by the secondary shortcut."
++          }
+         }
+       },
+       "language": {
+diff --git a/src/stores/settingsStore.ts b/src/stores/settingsStore.ts
+index b3a6de6..9ceee55 100644
+--- a/src/stores/settingsStore.ts
++++ b/src/stores/settingsStore.ts
+@@ -101,6 +101,10 @@ const settingUpdaters: {
+     commands.changeWhatsNewLastSeenVersionSetting(value as string),
+   shortcut_activation: (value) =>
+     commands.changeShortcutActivationSetting(value as ShortcutActivation),
++  primary_shortcut_model: (value) =>
++    commands.changeShortcutModelSetting("transcribe", value as string),
++  secondary_shortcut_model: (value) =>
++    commands.changeShortcutModelSetting("transcribe_secondary", value as string),
+   hold_threshold_ms: (value) =>
+     commands.changeHoldThresholdMsSetting(value as number),
+   selected_microphone: (value) =>
